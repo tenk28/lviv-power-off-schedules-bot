@@ -2,11 +2,10 @@
 
 import requests
 import os
-import hashlib
-import time
+import re
+import html
 import asyncio
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
 from telegram.ext import ApplicationBuilder
 from typing import NamedTuple
 
@@ -15,83 +14,102 @@ load_dotenv()  # loads .env from current folder
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = int(os.getenv('CHAT_ID'))
 CHECK_DELAY_SECS = int(os.getenv('CHECK_DELAY_SECS')) # seconds
-URL = "https://poweron.loe.lviv.ua/"
-DATA_FILEPATH = "data.txt"
+API_BASE_URL = "https://api.loe.lviv.ua"
+SCHEDULE_API_URL = f"{API_BASE_URL}/api/menus?page=1&type=photo-grafic"
+DATA_FILEPATH = os.getenv('DATA_FILEPATH', "data.txt")
+GROUP = os.getenv('GROUP', "").strip() # e.g. "3.1"; empty means track the whole schedule
 
 class PowerOffData(NamedTuple):
     power_off_str: str
     picture_url: str
 
-async def get_poweroff_data() -> PowerOffData | None:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(URL, wait_until="networkidle")
+def html_to_text(raw_html: str) -> str:
+    paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', raw_html, flags=re.S)
+    lines = [html.unescape(re.sub(r'<[^>]+>', '', p)).strip() for p in paragraphs]
+    return "\n".join(line for line in lines if line)
 
-        # --- TEXT ---
-        text_locator = page.locator(
-            '//*[@id="root"]/div/div/div[1]/div[2]/div[1]/div/p[7]'
-        )
+def build_message(power_off_str: str) -> tuple[str, str]:
+    """Returns (text to track for changes, caption to send)."""
+    if not GROUP:
+        return power_off_str, power_off_str
 
-        if await text_locator.count() == 0:
-            await browser.close()
-            return None
+    lines = power_off_str.splitlines()
+    updated_at = next((l for l in lines if l.startswith("Інформація станом")), "")
+    group_line = next((l for l in lines if l.startswith(f"Група {GROUP}.")), f"Група {GROUP}. Немає даних.")
 
-        poweroff_text = (await text_locator.text_content()).strip()
+    # Only the group line is tracked, so a new date or a refresh
+    # of other groups doesn't trigger a message
+    tracked = group_line
+    caption = "\n".join(l for l in (updated_at, group_line) if l)
+    return tracked, caption
 
-        # --- IMAGE ---
-        img_locator = page.locator(
-            "(//img[starts-with(@src,'http') and not(contains(@src,'svg'))])[1]"
-        )
+def get_poweroff_data() -> PowerOffData | None:
+    response = requests.get(SCHEDULE_API_URL, timeout=10)
+    response.raise_for_status()
 
-        if await img_locator.count() == 0:
-            await browser.close()
-            return None
+    # The API answers either with a plain list or with a JSON-LD (hydra) object
+    payload = response.json()
+    members = payload.get("hydra:member", []) if isinstance(payload, dict) else payload
+    if not members:
+        return None
 
-        image_url = await img_locator.get_attribute("src")
+    # The site shows menuItems[0] as today's schedule
+    menu_items = members[0].get("menuItems", [])
+    if not menu_items:
+        return None
 
-        await browser.close()
+    today = menu_items[0]
+    poweroff_text = html_to_text(today.get("rawHtml") or "")
+    image_path = today.get("imageUrl") or ""
 
-        return PowerOffData(
-            poweroff_text,
-            image_url,
-        )
+    if not poweroff_text or not image_path:
+        return None
+
+    return PowerOffData(
+        poweroff_text,
+        API_BASE_URL + image_path,
+    )
 
 def download_picture_to_memory(pic_url: str) -> bytes:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": URL
-    }
-
-    response = requests.get(pic_url, headers=headers, timeout=10)
+    response = requests.get(pic_url, timeout=10)
     response.raise_for_status()
 
     return response.content
 
+async def check_for_update(app):
+    power_off_data = await asyncio.to_thread(get_poweroff_data)
+    if not power_off_data:
+        print("Schedule not found in API response")
+        return
+
+    prev_data_str: str = ""
+
+    if os.path.isfile(DATA_FILEPATH):
+        with open(DATA_FILEPATH, "r") as f:
+            prev_data_str = f.read()
+
+    tracked_str, caption = build_message(power_off_data.power_off_str)
+    if prev_data_str == tracked_str:
+        print("Schedule hasn't updated")
+        return
+
+    print("New schedule detected, updating")
+
+    new_pic_bytes = await asyncio.to_thread(download_picture_to_memory, power_off_data.picture_url)
+    await app.bot.send_photo(chat_id=CHAT_ID, photo=new_pic_bytes, caption=caption, disable_notification=True)
+
+    with open(DATA_FILEPATH, "w") as f:
+        f.write(tracked_str)
+
 async def polling(app):
     while(True):
         print('New verification iteration')
-        power_off_data = await get_poweroff_data()
-        if power_off_data:
-            prev_data_str: str = ""
-            
-            if os.path.isfile(DATA_FILEPATH):
-                with open(DATA_FILEPATH, "r") as f:
-                    prev_data_str = f.read()
+        try:
+            await check_for_update(app)
+        except Exception as e:
+            print(f"Verification failed: {e!r}")
 
-            new_power_off_str = power_off_data.power_off_str
-            if prev_data_str != new_power_off_str:
-                print("New schedule detected, updating")
-                
-                with open(DATA_FILEPATH, "w") as f:
-                    f.write(new_power_off_str)
-
-                new_pic_bytes = download_picture_to_memory(power_off_data.picture_url)
-                await app.bot.send_photo(chat_id=CHAT_ID, photo=new_pic_bytes, caption=new_power_off_str, disable_notification=True)
-            else:
-                print("Schedule hasn't updated")
-
-        time.sleep(CHECK_DELAY_SECS)
+        await asyncio.sleep(CHECK_DELAY_SECS)
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
