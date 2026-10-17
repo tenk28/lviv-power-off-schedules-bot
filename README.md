@@ -38,6 +38,7 @@ vim .env
 | `CHAT_ID` | Chat to send schedules to |
 | `CHECK_DELAY_SECS` | Delay between checks, in seconds |
 | `GROUP` | Optional. Outage group to track, e.g. `3.1`. A message is sent only when this group's outage hours change (a new date with the same hours is not sent). Leave empty to track the whole schedule |
+| `FAIL_ALERT_THRESHOLD` | Optional, default `3`. After this many failed checks in a row (API unavailable, format changed, group not found) the bot sends a warning to the chat, and a second message once it recovers |
 
 ### 3. Build and start
 ```bash
